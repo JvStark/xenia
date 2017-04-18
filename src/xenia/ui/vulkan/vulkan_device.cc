@@ -55,6 +55,9 @@ VulkanDevice::VulkanDevice(VulkanInstance* instance) : instance_(instance) {
     DeclareRequiredLayer("VK_LAYER_LUNARG_image", Version::Make(0, 0, 0), true);
     */
   }
+
+  DeclareRequiredExtension(VK_EXT_DEBUG_MARKER_EXTENSION_NAME,
+                           Version::Make(0, 0, 0), true);
 }
 
 VulkanDevice::~VulkanDevice() {
@@ -72,7 +75,7 @@ bool VulkanDevice::Initialize(DeviceInfo device_info) {
   // Gather list of enabled extension names.
   auto extensions_result =
       CheckRequirements(required_extensions_, device_info.extensions);
-  auto& enabled_extensions = extensions_result.second;
+  enabled_extensions_ = extensions_result.second;
 
   // We wait until both extensions and layers are checked before failing out so
   // that the user gets a complete list of what they have/don't.
@@ -163,8 +166,8 @@ bool VulkanDevice::Initialize(DeviceInfo device_info) {
   create_info.enabledLayerCount = static_cast<uint32_t>(enabled_layers.size());
   create_info.ppEnabledLayerNames = enabled_layers.data();
   create_info.enabledExtensionCount =
-      static_cast<uint32_t>(enabled_extensions.size());
-  create_info.ppEnabledExtensionNames = enabled_extensions.data();
+      static_cast<uint32_t>(enabled_extensions_.size());
+  create_info.ppEnabledExtensionNames = enabled_extensions_.data();
   create_info.pEnabledFeatures = &enabled_features;
 
   auto err = vkCreateDevice(device_info.handle, &create_info, nullptr, &handle);
@@ -187,6 +190,13 @@ bool VulkanDevice::Initialize(DeviceInfo device_info) {
       FatalVulkanError(std::string("Device initialization failed; unknown: ") +
                        to_string(err));
       return false;
+  }
+
+  // Set flags so we can track enabled extensions easily.
+  for (auto& ext : enabled_extensions_) {
+    if (!std::strcmp(ext, VK_EXT_DEBUG_MARKER_EXTENSION_NAME)) {
+      debug_marker_ena_ = true;
+    }
   }
 
   device_info_ = std::move(device_info);
@@ -219,6 +229,29 @@ VkQueue VulkanDevice::AcquireQueue() {
 void VulkanDevice::ReleaseQueue(VkQueue queue) {
   std::lock_guard<std::mutex> lock(queue_mutex_);
   free_queues_.push_back(queue);
+}
+
+void VulkanDevice::DbgSetObjectName(VkDevice device, uint64_t object,
+                                    VkDebugReportObjectTypeEXT object_type,
+                                    std::string name) {
+  VkDebugMarkerObjectNameInfoEXT info;
+  info.sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT;
+  info.pNext = nullptr;
+  info.objectType = object_type;
+  info.object = object;
+  info.pObjectName = name.c_str();
+  vkDebugMarkerSetObjectNameEXT(device, &info);
+}
+
+void VulkanDevice::DbgSetObjectName(uint64_t object,
+                                    VkDebugReportObjectTypeEXT object_type,
+                                    std::string name) {
+  if (!debug_marker_ena_) {
+    // Extension disabled.
+    return;
+  }
+
+  DbgSetObjectName(*this, object, object_type, name);
 }
 
 bool VulkanDevice::is_renderdoc_attached() const {

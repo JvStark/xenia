@@ -52,17 +52,12 @@ Win32Loop::~Win32Loop() {
 
 void Win32Loop::ThreadMain() {
   MSG msg;
-  while (!should_exit_) {
-    DWORD result =
-        MsgWaitForMultipleObjectsEx(0, nullptr, INFINITE, QS_ALLINPUT, 0);
-
-    if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-      TranslateMessage(&msg);
-      DispatchMessage(&msg);
-    }
+  while (!should_exit_ && GetMessage(&msg, NULL, 0, 0)) {
+    TranslateMessage(&msg);
+    DispatchMessage(&msg);
 
     // Process queued functions.
-    std::lock_guard<std::mutex> lock(posted_functions_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(posted_functions_mutex_);
     for (auto it = posted_functions_.begin(); it != posted_functions_.end();) {
       (*it).Call();
       it = posted_functions_.erase(it);
@@ -80,7 +75,7 @@ bool Win32Loop::is_on_loop_thread() {
 void Win32Loop::Post(std::function<void()> fn) {
   assert_true(thread_id_ != 0);
   {
-    std::lock_guard<std::mutex> lock(posted_functions_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(posted_functions_mutex_);
     PostedFn posted_fn(fn);
     posted_functions_.push_back(posted_fn);
   }

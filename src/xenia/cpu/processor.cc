@@ -28,11 +28,9 @@
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/stack_walker.h"
+#include "xenia/cpu/thread.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
-
-// HACK(benvanik): XThread has too much stuff :/
-#include "xenia/kernel/xthread.h"
 
 // TODO(benvanik): based on compiler support
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -49,6 +47,10 @@ DEFINE_string(trace_function_data_path, "", "File to write trace data to.");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.");
 
 namespace xe {
+namespace kernel {
+class XThread;
+}  // namespace kernel
+
 namespace cpu {
 
 using xe::cpu::ppc::PPCOpcode;
@@ -60,6 +62,7 @@ class BuiltinModule : public Module {
       : Module(processor), name_("builtin") {}
 
   const std::string& name() const override { return name_; }
+  bool is_executable() const override { return false; }
 
   bool ContainsAddress(uint32_t address) override {
     return (address & 0xFFFFFFF0) == 0xFFFFFFF0;
@@ -92,7 +95,7 @@ Processor::~Processor() {
   }
 }
 
-bool Processor::Setup() {
+bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
   // TODO(benvanik): query mode from debugger?
   debug_info_flags_ = 0;
 
@@ -110,26 +113,10 @@ bool Processor::Setup() {
     return false;
   }
 
-  std::unique_ptr<xe::cpu::backend::Backend> backend;
-  if (!backend) {
-#if defined(XENIA_HAS_X64_BACKEND) && XENIA_HAS_X64_BACKEND
-    if (FLAGS_cpu == "x64") {
-      backend.reset(new xe::cpu::backend::x64::X64Backend(this));
-    }
-#endif  // XENIA_HAS_X64_BACKEND
-    if (FLAGS_cpu == "any") {
-#if defined(XENIA_HAS_X64_BACKEND) && XENIA_HAS_X64_BACKEND
-      if (!backend) {
-        backend.reset(new xe::cpu::backend::x64::X64Backend(this));
-      }
-#endif  // XENIA_HAS_X64_BACKEND
-    }
-  }
-
   if (!backend) {
     return false;
   }
-  if (!backend->Initialize()) {
+  if (!backend->Initialize(this)) {
     return false;
   }
   if (!frontend->Initialize()) {
@@ -490,8 +477,7 @@ void Processor::OnFunctionDefined(Function* function) {
 }
 
 void Processor::OnThreadCreated(uint32_t thread_handle,
-                                ThreadState* thread_state,
-                                kernel::XThread* thread) {
+                                ThreadState* thread_state, Thread* thread) {
   auto global_lock = global_critical_region_.Acquire();
   auto thread_info = std::make_unique<ThreadDebugInfo>();
   thread_info->thread_handle = thread_handle;
@@ -682,7 +668,7 @@ bool Processor::OnThreadBreakpointHit(Exception* ex) {
     debug_listener_->OnExecutionPaused();
   }
 
-  thread_info->thread->Suspend(nullptr);
+  thread_info->thread->thread()->Suspend();
 
   // Apply thread context changes.
   // TODO(benvanik): apply to all threads?
@@ -710,7 +696,7 @@ bool Processor::OnUnhandledException(Exception* ex) {
   }
 
   // If this isn't a managed thread, fail - let VS handle it for now.
-  if (!XThread::IsInThread()) {
+  if (!Thread::IsInThread()) {
     return false;
   }
 
@@ -719,7 +705,7 @@ bool Processor::OnUnhandledException(Exception* ex) {
   // Suspend all guest threads (but this one).
   SuspendAllThreads();
 
-  UpdateThreadExecutionStates(XThread::GetCurrentThreadId(),
+  UpdateThreadExecutionStates(Thread::GetCurrentThreadId(),
                               ex->thread_context());
 
   // Stop and notify the listener.
@@ -732,7 +718,7 @@ bool Processor::OnUnhandledException(Exception* ex) {
   debug_listener_->OnExecutionPaused();
 
   // Suspend self.
-  XThread::GetCurrentThread()->Suspend(nullptr);
+  Thread::GetCurrentThread()->thread()->Suspend();
 
   return true;
 }
@@ -756,8 +742,8 @@ bool Processor::SuspendAllThreads() {
                thread_info->state == ThreadDebugInfo::State::kExited) {
       // Thread is dead and cannot be suspended - ignore.
       continue;
-    } else if (XThread::IsInThread() &&
-               thread_info->thread_id == XThread::GetCurrentThreadId()) {
+    } else if (Thread::IsInThread() &&
+               thread_info->thread_id == Thread::GetCurrentThreadId()) {
       // Can't suspend ourselves.
       continue;
     }
@@ -766,7 +752,7 @@ bool Processor::SuspendAllThreads() {
       // Thread is a host thread, and we aren't suspending those (for now).
       continue;
     }
-    bool did_suspend = XSUCCEEDED(thread->Suspend(nullptr));
+    bool did_suspend = thread->thread()->Suspend(nullptr);
     assert_true(did_suspend);
     thread_info->suspended = true;
   }
@@ -785,7 +771,7 @@ bool Processor::ResumeThread(uint32_t thread_id) {
                thread_info->state == ThreadDebugInfo::State::kZombie);
   thread_info->suspended = false;
   auto thread = thread_info->thread;
-  return XSUCCEEDED(thread->Resume());
+  return thread->thread()->Resume();
 }
 
 bool Processor::ResumeAllThreads() {
@@ -799,8 +785,8 @@ bool Processor::ResumeAllThreads() {
                thread_info->state == ThreadDebugInfo::State::kExited) {
       // Thread is dead and cannot be resumed - ignore.
       continue;
-    } else if (XThread::IsInThread() &&
-               thread_info->thread_id == XThread::GetCurrentThreadId()) {
+    } else if (Thread::IsInThread() &&
+               thread_info->thread_id == Thread::GetCurrentThreadId()) {
       // Can't resume ourselves.
       continue;
     }
@@ -810,7 +796,7 @@ bool Processor::ResumeAllThreads() {
       continue;
     }
     thread_info->suspended = false;
-    bool did_resume = XSUCCEEDED(thread->Resume());
+    bool did_resume = thread->thread()->Resume();
     assert_true(did_resume);
   }
   return true;
@@ -986,7 +972,7 @@ bool Processor::StepToGuestAddress(uint32_t thread_id, uint32_t pc) {
   if (functions.empty()) {
     // Function hasn't been generated yet. Generate it.
     if (!ResolveFunction(pc)) {
-      XELOGE("XThread::StepToAddress(%.8X) - Function could not be resolved",
+      XELOGE("Processor::StepToAddress(%.8X) - Function could not be resolved",
              pc);
       return false;
     }
@@ -1004,7 +990,7 @@ bool Processor::StepToGuestAddress(uint32_t thread_id, uint32_t pc) {
   auto thread_info = QueryThreadDebugInfo(thread_id);
   uint32_t suspend_count = 1;
   while (suspend_count) {
-    thread_info->thread->Resume(&suspend_count);
+    thread_info->thread->thread()->Resume(&suspend_count);
   }
 
   fence.Wait();
@@ -1074,7 +1060,7 @@ uint32_t Processor::StepIntoGuestBranchTarget(uint32_t thread_id, uint32_t pc) {
     // HACK
     uint32_t suspend_count = 1;
     while (suspend_count) {
-      thread->Resume(&suspend_count);
+      thread->thread()->Resume(&suspend_count);
     }
 
     fence.Wait();
@@ -1089,7 +1075,7 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
   // This cannot be done if we're the calling thread!
   if (thread_id == ThreadState::GetThreadID()) {
     assert_always(
-        "XThread::StepToSafePoint(): target thread is the calling thread!");
+        "Processor::StepToSafePoint(): target thread is the calling thread!");
     return 0;
   }
   auto thread_info = QueryThreadDebugInfo(thread_id);
@@ -1212,11 +1198,15 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
     } else {
       // We've managed to catch a thread before it called into the guest.
       // Set a breakpoint on its startup procedure and capture it there.
+      // TODO(DrChat): Reimplement
+      assert_always("Unimplemented");
+      /*
       auto creation_params = thread->creation_params();
       pc = creation_params->xapi_thread_startup
                ? creation_params->xapi_thread_startup
                : creation_params->start_address;
       StepToGuestAddress(thread_id, pc);
+      */
     }
   }
 

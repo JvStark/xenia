@@ -10,6 +10,7 @@
 #include "xenia/gpu/command_processor.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
@@ -134,13 +135,17 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      uint32_t loop_count = 0;
       do {
-        // TODO(benvanik): if we go longer than Nms, switch to waiting?
-        // It'll keep us from burning power.
-        // const int wait_time_ms = 5;
-        // xe::threading::Wait(write_ptr_index_event_.get(), true,
-        //                     std::chrono::milliseconds(wait_time_ms));
+        // If we spin around too much, revert to a "low-power" state.
+        if (loop_count > 500) {
+          const int wait_time_ms = 5;
+          xe::threading::Wait(write_ptr_index_event_.get(), true,
+                              std::chrono::milliseconds(wait_time_ms));
+        }
+
         xe::threading::MaybeYield();
+        loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D ||
@@ -224,6 +229,7 @@ bool CommandProcessor::SetupContext() { return true; }
 void CommandProcessor::ShutdownContext() { context_.reset(); }
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t log2_size) {
+  read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(std::pow(2u, log2_size));
 }
@@ -252,6 +258,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     return;
   }
 
+  // 0x1844 - pointer to frontbuffer
   regs->values[index].u32 = value;
   if (!regs->GetRegisterInfo(index)) {
     XELOGW("GPU: Write to unknown register (%.4X = %.8X)", index, value);
@@ -290,8 +297,8 @@ void CommandProcessor::MakeCoherent() {
 
   RegisterFile* regs = register_file_;
   auto status_host = regs->values[XE_GPU_REG_COHER_STATUS_HOST].u32;
-  // auto base_host = regs->values[XE_GPU_REG_COHER_BASE_HOST].u32;
-  // auto size_host = regs->values[XE_GPU_REG_COHER_SIZE_HOST].u32;
+  auto base_host = regs->values[XE_GPU_REG_COHER_BASE_HOST].u32;
+  auto size_host = regs->values[XE_GPU_REG_COHER_SIZE_HOST].u32;
 
   if (!(status_host & 0x80000000ul)) {
     return;
@@ -649,6 +656,7 @@ bool CommandProcessor::ExecutePacketType3(RingBuffer* reader, uint32_t packet) {
     default:
       XELOGGPU("Unimplemented GPU OPCODE: 0x%.2X\t\tCOUNT: %d\n", opcode,
                count);
+      assert_always();
       reader->AdvanceRead(count * sizeof(uint32_t));
       break;
   }
@@ -741,7 +749,9 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(RingBuffer* reader,
                                                           uint32_t count) {
   // indirect buffer dispatch
   uint32_t list_ptr = CpuToGpu(reader->Read<uint32_t>(true));
-  uint32_t list_length = reader->Read<uint32_t>(true) & 0xFFFFF;
+  uint32_t list_length = reader->Read<uint32_t>(true);
+  assert_zero(list_length & ~0xFFFFF);
+  list_length &= 0xFFFFF;
   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
   return true;
 }
@@ -1080,8 +1090,14 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(RingBuffer* reader,
     assert_always();
   }
 
-  return IssueDraw(prim_type, index_count,
-                   is_indexed ? &index_buffer_info : nullptr);
+  bool success = IssueDraw(prim_type, index_count,
+                           is_indexed ? &index_buffer_info : nullptr);
+  if (!success) {
+    XELOGE("PM4_DRAW_INDX(%d, %d, %d): Failed in backend", index_count,
+           prim_type, src_sel);
+  }
+
+  return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(RingBuffer* reader,
@@ -1099,7 +1115,13 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(RingBuffer* reader,
   // uint32_t index_ptr = reader->ptr();
   reader->AdvanceRead((count - 1) * sizeof(uint32_t));
 
-  return IssueDraw(prim_type, index_count, nullptr);
+  bool success = IssueDraw(prim_type, index_count, nullptr);
+  if (!success) {
+    XELOGE("PM4_DRAW_INDX_IMM(%d, %d): Failed in backend", index_count,
+           prim_type);
+  }
+
+  return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(RingBuffer* reader,

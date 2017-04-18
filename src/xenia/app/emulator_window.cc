@@ -32,6 +32,7 @@ using xe::ui::KeyEvent;
 using xe::ui::MenuItem;
 using xe::ui::MouseEvent;
 using xe::ui::UIEvent;
+using xe::ui::FileDropEvent;
 
 const std::wstring kBaseTitle = L"xenia";
 
@@ -80,6 +81,9 @@ bool EmulatorWindow::Initialize() {
     exit(1);
   });
   loop_->on_quit.AddListener([this](UIEvent* e) { window_.reset(); });
+
+  window_->on_file_drop.AddListener(
+      [this](FileDropEvent* e) { FileDrop(e->filename()); });
 
   window_->on_key_down.AddListener([this](KeyEvent* e) {
     bool handled = true;
@@ -163,6 +167,9 @@ bool EmulatorWindow::Initialize() {
     file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, L"&Open", L"Ctrl+O",
                          std::bind(&EmulatorWindow::FileOpen, this)));
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, L"Close",
+                         std::bind(&EmulatorWindow::FileClose, this)));
     file_menu->AddChild(MenuItem::Create(MenuItem::Type::kString, L"E&xit",
                                          L"Alt+F4",
                                          [this]() { window_->Close(); }));
@@ -257,6 +264,15 @@ bool EmulatorWindow::Initialize() {
   return true;
 }
 
+void EmulatorWindow::FileDrop(wchar_t* filename) {
+  std::wstring path = filename;
+  auto result = emulator_->LaunchPath(path);
+  if (XFAILED(result)) {
+    // TODO: Display a message box.
+    XELOGE("Failed to launch target: %.8X", result);
+  }
+}
+
 void EmulatorWindow::FileOpen() {
   std::wstring path;
 
@@ -288,6 +304,12 @@ void EmulatorWindow::FileOpen() {
       // TODO: Display a message box.
       XELOGE("Failed to launch target: %.8X", result);
     }
+  }
+}
+
+void EmulatorWindow::FileClose() {
+  if (emulator_->is_title_open()) {
+    emulator_->TerminateTitle();
   }
 }
 

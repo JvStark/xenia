@@ -22,6 +22,7 @@
 #include <string.h>
 #include "debug_report.h"
 #include "wsi.h"
+#include "extensions.h"
 
 static inline void *trampolineGetProcAddr(struct loader_instance *inst,
                                           const char *funcName) {
@@ -304,6 +305,14 @@ static inline void *trampolineGetProcAddr(struct loader_instance *inst,
     if (wsi_swapchain_instance_gpa(inst, funcName, &addr))
         return addr;
 
+    if (extension_instance_gpa(inst, funcName, &addr))
+        return addr;
+
+    // Unknown physical device extensions
+    if (loader_phys_dev_ext_gpa(inst, funcName, true, &addr, NULL))
+        return addr;
+
+    // Unknown device extensions
     addr = loader_dev_ext_gpa(inst, funcName);
     return addr;
 }
@@ -319,36 +328,6 @@ static inline void *globalGetProcAddr(const char *name) {
         return (void *)vkEnumerateInstanceExtensionProperties;
     if (!strcmp(name, "EnumerateInstanceLayerProperties"))
         return (void *)vkEnumerateInstanceLayerProperties;
-
-    return NULL;
-}
-
-/* These functions require special handling by the loader.
-*  They are not just generic trampoline code entrypoints.
-*  Thus GPA must return loader entrypoint for these instead of first function
-*  in the chain. */
-static inline void *loader_non_passthrough_gipa(const char *name) {
-    if (!name || name[0] != 'v' || name[1] != 'k')
-        return NULL;
-
-    name += 2;
-    if (!strcmp(name, "CreateInstance"))
-        return (void *)vkCreateInstance;
-    if (!strcmp(name, "DestroyInstance"))
-        return (void *)vkDestroyInstance;
-    if (!strcmp(name, "GetDeviceProcAddr"))
-        return (void *)vkGetDeviceProcAddr;
-    // remove once no longer locks
-    if (!strcmp(name, "EnumeratePhysicalDevices"))
-        return (void *)vkEnumeratePhysicalDevices;
-    if (!strcmp(name, "EnumerateDeviceExtensionProperties"))
-        return (void *)vkEnumerateDeviceExtensionProperties;
-    if (!strcmp(name, "EnumerateDeviceLayerProperties"))
-        return (void *)vkEnumerateDeviceLayerProperties;
-    if (!strcmp(name, "GetInstanceProcAddr"))
-        return (void *)vkGetInstanceProcAddr;
-    if (!strcmp(name, "CreateDevice"))
-        return (void *)vkCreateDevice;
 
     return NULL;
 }

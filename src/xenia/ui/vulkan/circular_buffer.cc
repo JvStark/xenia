@@ -164,8 +164,8 @@ bool CircularBuffer::CanAcquire(VkDeviceSize length) {
   return false;
 }
 
-CircularBuffer::Allocation* CircularBuffer::Acquire(
-    VkDeviceSize length, std::shared_ptr<Fence> fence) {
+CircularBuffer::Allocation* CircularBuffer::Acquire(VkDeviceSize length,
+                                                    VkFence fence) {
   VkDeviceSize aligned_length = xe::round_up(length, alignment_);
   if (!CanAcquire(aligned_length)) {
     return nullptr;
@@ -232,6 +232,16 @@ void CircularBuffer::Flush(Allocation* allocation) {
   vkFlushMappedMemoryRanges(*device_, 1, &range);
 }
 
+void CircularBuffer::Flush(VkDeviceSize offset, VkDeviceSize length) {
+  VkMappedMemoryRange range;
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.pNext = nullptr;
+  range.memory = gpu_memory_;
+  range.offset = gpu_base_ + offset;
+  range.size = length;
+  vkFlushMappedMemoryRanges(*device_, 1, &range);
+}
+
 void CircularBuffer::Clear() {
   for (auto alloc : allocations_) {
     delete alloc;
@@ -243,7 +253,7 @@ void CircularBuffer::Clear() {
 
 void CircularBuffer::Scavenge() {
   for (auto it = allocations_.begin(); it != allocations_.end();) {
-    if ((*it)->fence->status() != VK_SUCCESS) {
+    if (vkGetFenceStatus(*device_, (*it)->fence) != VK_SUCCESS) {
       // Don't bother freeing following allocations to ensure proper ordering.
       break;
     }

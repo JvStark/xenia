@@ -49,14 +49,7 @@ void VulkanCommandProcessor::RequestFrameTrace(const std::wstring& root_path) {
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
-
-  auto status = vkQueueWaitIdle(queue_);
-  CheckResult(status, "vkQueueWaitIdle");
-
-  buffer_cache_->ClearCache();
-  pipeline_cache_->ClearCache();
-  render_cache_->ClearCache();
-  texture_cache_->ClearCache();
+  cache_clear_requested_ = true;
 }
 
 bool VulkanCommandProcessor::SetupContext() {
@@ -80,8 +73,8 @@ bool VulkanCommandProcessor::SetupContext() {
       *device_, device_->queue_family_index(), VK_COMMAND_BUFFER_LEVEL_PRIMARY);
 
   // Initialize the state machine caches.
-  buffer_cache_ = std::make_unique<BufferCache>(register_file_, device_,
-                                                kDefaultBufferCacheCapacity);
+  buffer_cache_ = std::make_unique<BufferCache>(
+      register_file_, memory_, device_, kDefaultBufferCacheCapacity);
   texture_cache_ = std::make_unique<TextureCache>(memory_, register_file_,
                                                   &trace_writer_, device_);
   pipeline_cache_ = std::make_unique<PipelineCache>(
@@ -89,15 +82,29 @@ bool VulkanCommandProcessor::SetupContext() {
       texture_cache_->texture_descriptor_set_layout());
   render_cache_ = std::make_unique<RenderCache>(register_file_, device_);
 
+  VkEventCreateInfo info = {
+      VK_STRUCTURE_TYPE_EVENT_CREATE_INFO, nullptr, 0,
+  };
+
+  VkResult result =
+      vkCreateEvent(*device_, &info, nullptr,
+                    reinterpret_cast<VkEvent*>(&swap_state_.backend_data));
+  if (result != VK_SUCCESS) {
+    return false;
+  }
+
   return true;
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
   // TODO(benvanik): wait until idle.
 
+  vkDestroyEvent(*device_, reinterpret_cast<VkEvent>(swap_state_.backend_data),
+                 nullptr);
+
   if (swap_state_.front_buffer_texture) {
-    // Free swap chain images.
-    DestroySwapImages();
+    // Free swap chain image.
+    DestroySwapImage();
   }
 
   buffer_cache_.reset();
@@ -123,9 +130,15 @@ void VulkanCommandProcessor::MakeCoherent() {
 
   CommandProcessor::MakeCoherent();
 
+  // Make region coherent
   if (status_host & 0x80000000ul) {
     // TODO(benvanik): less-fine-grained clearing.
     buffer_cache_->InvalidateCache();
+
+    if ((status_host & 0x01000000) != 0 && (status_host & 0x02000000) == 0) {
+      coher_base_vc_ = regs->values[XE_GPU_REG_COHER_BASE_HOST].u32;
+      coher_size_vc_ = regs->values[XE_GPU_REG_COHER_SIZE_HOST].u32;
+    }
   }
 }
 
@@ -149,8 +162,33 @@ void VulkanCommandProcessor::ReturnFromWait() {
   CommandProcessor::ReturnFromWait();
 }
 
-void VulkanCommandProcessor::CreateSwapImages(VkCommandBuffer setup_buffer,
-                                              VkExtent2D extents) {
+void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  CommandProcessor::WriteRegister(index, value);
+
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    uint32_t offset = index - XE_GPU_REG_SHADER_CONSTANT_000_X;
+    offset /= 4 * 4;
+    offset ^= 0x3F;
+
+    dirty_float_constants_ |= (1ull << offset);
+  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+             index <= XE_GPU_REG_SHADER_CONSTANT_BOOL_224_255) {
+    uint32_t offset = index - XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031;
+    offset ^= 0x7;
+
+    dirty_bool_constants_ |= (1 << offset);
+  } else if (index >= XE_GPU_REG_SHADER_CONSTANT_LOOP_00 &&
+             index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    uint32_t offset = index - XE_GPU_REG_SHADER_CONSTANT_LOOP_00;
+    offset ^= 0x1F;
+
+    dirty_loop_constants_ |= (1 << offset);
+  }
+}
+
+void VulkanCommandProcessor::CreateSwapImage(VkCommandBuffer setup_buffer,
+                                             VkExtent2D extents) {
   VkImageCreateInfo image_info;
   std::memset(&image_info, 0, sizeof(VkImageCreateInfo));
   image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -168,34 +206,23 @@ void VulkanCommandProcessor::CreateSwapImages(VkCommandBuffer setup_buffer,
   image_info.pQueueFamilyIndices = nullptr;
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-  VkImage image_fb, image_bb;
+  VkImage image_fb;
   auto status = vkCreateImage(*device_, &image_info, nullptr, &image_fb);
   CheckResult(status, "vkCreateImage");
 
-  status = vkCreateImage(*device_, &image_info, nullptr, &image_bb);
-  CheckResult(status, "vkCreateImage");
-
-  // Bind memory to images.
+  // Bind memory to image.
   VkMemoryRequirements mem_requirements;
   vkGetImageMemoryRequirements(*device_, image_fb, &mem_requirements);
-  fb_memory = device_->AllocateMemory(mem_requirements, 0);
-  assert_not_null(fb_memory);
+  fb_memory_ = device_->AllocateMemory(mem_requirements, 0);
+  assert_not_null(fb_memory_);
 
-  status = vkBindImageMemory(*device_, image_fb, fb_memory, 0);
-  CheckResult(status, "vkBindImageMemory");
-
-  vkGetImageMemoryRequirements(*device_, image_fb, &mem_requirements);
-  bb_memory = device_->AllocateMemory(mem_requirements, 0);
-  assert_not_null(bb_memory);
-
-  status = vkBindImageMemory(*device_, image_bb, bb_memory, 0);
+  status = vkBindImageMemory(*device_, image_fb, fb_memory_, 0);
   CheckResult(status, "vkBindImageMemory");
 
   std::lock_guard<std::mutex> lock(swap_state_.mutex);
   swap_state_.front_buffer_texture = reinterpret_cast<uintptr_t>(image_fb);
-  swap_state_.back_buffer_texture = reinterpret_cast<uintptr_t>(image_bb);
 
-  // Transition both images to general layout.
+  // Transition image to general layout.
   VkImageMemoryBarrier barrier;
   std::memset(&barrier, 0, sizeof(VkImageMemoryBarrier));
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -211,29 +238,81 @@ void VulkanCommandProcessor::CreateSwapImages(VkCommandBuffer setup_buffer,
   vkCmdPipelineBarrier(setup_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &barrier);
-
-  barrier.image = image_bb;
-
-  vkCmdPipelineBarrier(setup_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &barrier);
 }
 
-void VulkanCommandProcessor::DestroySwapImages() {
+void VulkanCommandProcessor::DestroySwapImage() {
   std::lock_guard<std::mutex> lock(swap_state_.mutex);
   vkDestroyImage(*device_,
                  reinterpret_cast<VkImage>(swap_state_.front_buffer_texture),
                  nullptr);
-  vkDestroyImage(*device_,
-                 reinterpret_cast<VkImage>(swap_state_.back_buffer_texture),
-                 nullptr);
-  vkFreeMemory(*device_, fb_memory, nullptr);
-  vkFreeMemory(*device_, bb_memory, nullptr);
+  vkFreeMemory(*device_, fb_memory_, nullptr);
 
   swap_state_.front_buffer_texture = 0;
-  swap_state_.back_buffer_texture = 0;
-  fb_memory = nullptr;
-  bb_memory = nullptr;
+  fb_memory_ = nullptr;
+}
+
+void VulkanCommandProcessor::BeginFrame() {
+  assert_false(frame_open_);
+
+  // TODO(benvanik): bigger batches.
+  // TODO(DrChat): Decouple setup buffer from current batch.
+  // Begin a new batch, and allocate and begin a command buffer and setup
+  // buffer.
+  current_batch_fence_ = command_buffer_pool_->BeginBatch();
+  current_command_buffer_ = command_buffer_pool_->AcquireEntry();
+  current_setup_buffer_ = command_buffer_pool_->AcquireEntry();
+
+  VkCommandBufferBeginInfo command_buffer_begin_info;
+  command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  command_buffer_begin_info.pNext = nullptr;
+  command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  command_buffer_begin_info.pInheritanceInfo = nullptr;
+  auto status =
+      vkBeginCommandBuffer(current_command_buffer_, &command_buffer_begin_info);
+  CheckResult(status, "vkBeginCommandBuffer");
+
+  status =
+      vkBeginCommandBuffer(current_setup_buffer_, &command_buffer_begin_info);
+  CheckResult(status, "vkBeginCommandBuffer");
+
+  // Flag renderdoc down to start a capture if requested.
+  // The capture will end when these commands are submitted to the queue.
+  static uint32_t frame = 0;
+  if (device_->is_renderdoc_attached() && !capturing_ &&
+      (FLAGS_vulkan_renderdoc_capture_all || trace_requested_)) {
+    if (queue_mutex_) {
+      queue_mutex_->lock();
+    }
+
+    capturing_ = true;
+    trace_requested_ = false;
+    device_->BeginRenderDocFrameCapture();
+
+    if (queue_mutex_) {
+      queue_mutex_->unlock();
+    }
+  }
+
+  frame_open_ = true;
+}
+
+void VulkanCommandProcessor::EndFrame() {
+  if (current_render_state_) {
+    render_cache_->EndRenderPass();
+    current_render_state_ = nullptr;
+  }
+
+  VkResult status = VK_SUCCESS;
+  status = vkEndCommandBuffer(current_setup_buffer_);
+  CheckResult(status, "vkEndCommandBuffer");
+  status = vkEndCommandBuffer(current_command_buffer_);
+  CheckResult(status, "vkEndCommandBuffer");
+
+  current_command_buffer_ = nullptr;
+  current_setup_buffer_ = nullptr;
+  command_buffer_pool_->EndBatch();
+
+  frame_open_ = false;
 }
 
 void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
@@ -249,9 +328,8 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     copy_commands = command_buffer_pool_->AcquireEntry();
     opened_batch = false;
   } else {
-    command_buffer_pool_->BeginBatch();
+    current_batch_fence_ = command_buffer_pool_->BeginBatch();
     copy_commands = command_buffer_pool_->AcquireEntry();
-    current_batch_fence_.reset(new ui::vulkan::Fence(*device_));
     opened_batch = true;
   }
 
@@ -267,15 +345,15 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     frontbuffer_ptr = last_copy_base_;
   }
 
-  if (!swap_state_.back_buffer_texture) {
-    CreateSwapImages(copy_commands, {frontbuffer_width, frontbuffer_height});
+  if (!swap_state_.front_buffer_texture) {
+    CreateSwapImage(copy_commands, {frontbuffer_width, frontbuffer_height});
   }
-  auto swap_bb = reinterpret_cast<VkImage>(swap_state_.back_buffer_texture);
+  auto swap_fb = reinterpret_cast<VkImage>(swap_state_.front_buffer_texture);
 
   // Issue the commands to copy the game's frontbuffer to our backbuffer.
   auto texture = texture_cache_->LookupAddress(
       frontbuffer_ptr, xe::round_up(frontbuffer_width, 32),
-      xe::round_up(frontbuffer_height, 32), TextureFormat::k_8_8_8_8);
+      /*xe::round_up(*/ frontbuffer_height /*, 32)*/, TextureFormat::k_8_8_8_8);
   if (texture) {
     texture->in_flight_fence = current_batch_fence_;
 
@@ -293,8 +371,8 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     barrier.image = texture->image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    vkCmdPipelineBarrier(copy_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
+    vkCmdPipelineBarrier(copy_commands, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &barrier);
 
     // Now issue a blit command.
@@ -310,12 +388,15 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
                           int32_t(frontbuffer_height), 1};
 
     vkCmdBlitImage(copy_commands, texture->image, texture->image_layout,
-                   swap_bb, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                   swap_fb, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                    VK_FILTER_LINEAR);
 
     std::lock_guard<std::mutex> lock(swap_state_.mutex);
     swap_state_.width = frontbuffer_width;
     swap_state_.height = frontbuffer_height;
+
+    auto swap_event = reinterpret_cast<VkEvent>(swap_state_.backend_data);
+    vkCmdSetEvent(copy_commands, swap_event, VK_PIPELINE_STAGE_TRANSFER_BIT);
   }
 
   status = vkEndCommandBuffer(copy_commands);
@@ -324,23 +405,15 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
   // Queue up current command buffers.
   // TODO(benvanik): bigger batches.
   std::vector<VkCommandBuffer> submit_buffers;
-  if (current_command_buffer_) {
-    if (current_render_state_) {
-      render_cache_->EndRenderPass();
-      current_render_state_ = nullptr;
-    }
-
-    status = vkEndCommandBuffer(current_setup_buffer_);
-    CheckResult(status, "vkEndCommandBuffer");
-    status = vkEndCommandBuffer(current_command_buffer_);
-    CheckResult(status, "vkEndCommandBuffer");
-
+  if (frame_open_) {
     // TODO(DrChat): If the setup buffer is empty, don't bother queueing it up.
     submit_buffers.push_back(current_setup_buffer_);
     submit_buffers.push_back(current_command_buffer_);
+    EndFrame();
+  }
 
-    current_command_buffer_ = nullptr;
-    current_setup_buffer_ = nullptr;
+  if (opened_batch) {
+    command_buffer_pool_->EndBatch();
   }
 
   submit_buffers.push_back(copy_commands);
@@ -356,7 +429,15 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = uint32_t(submit_buffers.size());
     submit_info.pCommandBuffers = submit_buffers.data();
-    status = vkQueueSubmit(queue_, 1, &submit_info, *current_batch_fence_);
+
+    submit_info.waitSemaphoreCount = 0;
+    submit_info.pWaitSemaphores = nullptr;
+    submit_info.pWaitDstStageMask = nullptr;
+
+    submit_info.signalSemaphoreCount = 0;
+    submit_info.pSignalSemaphores = nullptr;
+
+    status = vkQueueSubmit(queue_, 1, &submit_info, current_batch_fence_);
     CheckResult(status, "vkQueueSubmit");
 
     if (device_->is_renderdoc_attached() && capturing_) {
@@ -368,7 +449,15 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     }
   }
 
-  command_buffer_pool_->EndBatch(current_batch_fence_);
+  if (cache_clear_requested_) {
+    cache_clear_requested_ = false;
+    vkWaitForFences(*device_, 1, &current_batch_fence_, VK_TRUE, -1);
+
+    buffer_cache_->ClearCache();
+    pipeline_cache_->ClearCache();
+    render_cache_->ClearCache();
+    texture_cache_->ClearCache();
+  }
 
   // Scavenging.
   {
@@ -377,6 +466,9 @@ void VulkanCommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
         "gpu",
         "xe::gpu::vulkan::VulkanCommandProcessor::PerformSwap Scavenging");
 #endif  // FINE_GRAINED_DRAW_SCOPES
+    // Command buffers must be scavenged first to avoid a race condition.
+    // We don't want to reuse a batch when the caches haven't yet cleared old
+    // resources!
     command_buffer_pool_->Scavenge();
 
     texture_cache_->Scavenge();
@@ -435,47 +527,10 @@ bool VulkanCommandProcessor::IssueDraw(PrimitiveType primitive_type,
     return true;
   }
 
-  bool started_command_buffer = false;
-  if (!current_command_buffer_) {
-    // TODO(benvanik): bigger batches.
-    // TODO(DrChat): Decouple setup buffer from current batch.
-    command_buffer_pool_->BeginBatch();
-    current_command_buffer_ = command_buffer_pool_->AcquireEntry();
-    current_setup_buffer_ = command_buffer_pool_->AcquireEntry();
-    current_batch_fence_.reset(new ui::vulkan::Fence(*device_));
-
-    VkCommandBufferBeginInfo command_buffer_begin_info;
-    command_buffer_begin_info.sType =
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    command_buffer_begin_info.pNext = nullptr;
-    command_buffer_begin_info.flags =
-        VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    command_buffer_begin_info.pInheritanceInfo = nullptr;
-    auto status = vkBeginCommandBuffer(current_command_buffer_,
-                                       &command_buffer_begin_info);
-    CheckResult(status, "vkBeginCommandBuffer");
-
-    status =
-        vkBeginCommandBuffer(current_setup_buffer_, &command_buffer_begin_info);
-    CheckResult(status, "vkBeginCommandBuffer");
-
-    static uint32_t frame = 0;
-    if (device_->is_renderdoc_attached() && !capturing_ &&
-        (FLAGS_vulkan_renderdoc_capture_all || trace_requested_)) {
-      if (queue_mutex_) {
-        queue_mutex_->lock();
-      }
-
-      capturing_ = true;
-      trace_requested_ = false;
-      device_->BeginRenderDocFrameCapture();
-
-      if (queue_mutex_) {
-        queue_mutex_->unlock();
-      }
-    }
-
-    started_command_buffer = true;
+  bool started_frame = false;
+  if (!frame_open_) {
+    BeginFrame();
+    started_frame = true;
   }
   auto command_buffer = current_command_buffer_;
   auto setup_buffer = current_setup_buffer_;
@@ -492,10 +547,6 @@ bool VulkanCommandProcessor::IssueDraw(PrimitiveType primitive_type,
     current_render_state_ = render_cache_->BeginRenderPass(
         command_buffer, vertex_shader, pixel_shader);
     if (!current_render_state_) {
-      command_buffer_pool_->CancelBatch();
-      current_command_buffer_ = nullptr;
-      current_setup_buffer_ = nullptr;
-      current_batch_fence_ = nullptr;
       return false;
     }
   }
@@ -508,50 +559,26 @@ bool VulkanCommandProcessor::IssueDraw(PrimitiveType primitive_type,
       command_buffer, current_render_state_, vertex_shader, pixel_shader,
       primitive_type, &pipeline);
   if (pipeline_status == PipelineCache::UpdateStatus::kMismatch ||
-      started_command_buffer) {
+      started_frame) {
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       pipeline);
   } else if (pipeline_status == PipelineCache::UpdateStatus::kError) {
-    render_cache_->EndRenderPass();
-    command_buffer_pool_->CancelBatch();
-    current_command_buffer_ = nullptr;
-    current_setup_buffer_ = nullptr;
-    current_batch_fence_ = nullptr;
-    current_render_state_ = nullptr;
     return false;
   }
-  pipeline_cache_->SetDynamicState(command_buffer, started_command_buffer);
+  pipeline_cache_->SetDynamicState(command_buffer, started_frame);
 
   // Pass registers to the shaders.
   if (!PopulateConstants(command_buffer, vertex_shader, pixel_shader)) {
-    render_cache_->EndRenderPass();
-    command_buffer_pool_->CancelBatch();
-    current_command_buffer_ = nullptr;
-    current_setup_buffer_ = nullptr;
-    current_batch_fence_ = nullptr;
-    current_render_state_ = nullptr;
     return false;
   }
 
   // Upload and bind index buffer data (if we have any).
   if (!PopulateIndexBuffer(command_buffer, index_buffer_info)) {
-    render_cache_->EndRenderPass();
-    command_buffer_pool_->CancelBatch();
-    current_command_buffer_ = nullptr;
-    current_setup_buffer_ = nullptr;
-    current_batch_fence_ = nullptr;
-    current_render_state_ = nullptr;
     return false;
   }
 
   // Upload and bind all vertex buffer data.
   if (!PopulateVertexBuffers(command_buffer, vertex_shader)) {
-    render_cache_->EndRenderPass();
-    command_buffer_pool_->CancelBatch();
-    current_command_buffer_ = nullptr;
-    current_setup_buffer_ = nullptr;
-    current_batch_fence_ = nullptr;
-    current_render_state_ = nullptr;
     return false;
   }
 
@@ -560,12 +587,6 @@ bool VulkanCommandProcessor::IssueDraw(PrimitiveType primitive_type,
   // Setup buffer may be flushed to GPU if the texture cache needs it.
   if (!PopulateSamplers(command_buffer, setup_buffer, vertex_shader,
                         pixel_shader)) {
-    render_cache_->EndRenderPass();
-    command_buffer_pool_->CancelBatch();
-    current_command_buffer_ = nullptr;
-    current_setup_buffer_ = nullptr;
-    current_batch_fence_ = nullptr;
-    current_render_state_ = nullptr;
     return false;
   }
 
@@ -605,7 +626,7 @@ bool VulkanCommandProcessor::PopulateConstants(VkCommandBuffer command_buffer,
   // Upload the constants the shaders require.
   // These are optional, and if none are defined 0 will be returned.
   auto constant_offsets = buffer_cache_->UploadConstantRegisters(
-      vertex_shader->constant_register_map(),
+      current_setup_buffer_, vertex_shader->constant_register_map(),
       pixel_shader ? pixel_shader->constant_register_map() : dummy_map,
       current_batch_fence_);
   if (constant_offsets.first == VK_WHOLE_SIZE ||
@@ -655,13 +676,13 @@ bool VulkanCommandProcessor::PopulateIndexBuffer(
   trace_writer_.WriteMemoryRead(info.guest_base, info.length);
 
   // Upload (or get a cached copy of) the buffer.
-  const void* source_ptr =
-      memory_->TranslatePhysical<const void*>(info.guest_base);
-  size_t source_length =
+  uint32_t source_addr = info.guest_base;
+  uint32_t source_length =
       info.count * (info.format == IndexFormat::kInt32 ? sizeof(uint32_t)
                                                        : sizeof(uint16_t));
   auto buffer_ref = buffer_cache_->UploadIndexBuffer(
-      source_ptr, source_length, info.format, current_batch_fence_);
+      current_setup_buffer_, source_addr, source_length, info.format,
+      current_batch_fence_);
   if (buffer_ref.second == VK_WHOLE_SIZE) {
     // Failed to upload buffer.
     return false;
@@ -719,15 +740,14 @@ bool VulkanCommandProcessor::PopulateVertexBuffers(
     //     THIS CAN BE MASSIVELY INCORRECT (too large).
     size_t valid_range = size_t(fetch->size * 4);
 
-    trace_writer_.WriteMemoryRead(fetch->address << 2, valid_range);
+    uint32_t physical_address = fetch->address << 2;
+    trace_writer_.WriteMemoryRead(physical_address, valid_range);
 
     // Upload (or get a cached copy of) the buffer.
-    const void* source_ptr =
-        memory_->TranslatePhysical<const void*>(fetch->address << 2);
-    size_t source_length = valid_range;
+    uint32_t source_length = uint32_t(valid_range);
     auto buffer_ref = buffer_cache_->UploadVertexBuffer(
-        source_ptr, source_length, static_cast<Endian>(fetch->endian),
-        current_batch_fence_);
+        current_setup_buffer_, physical_address, source_length,
+        static_cast<Endian>(fetch->endian), current_batch_fence_);
     if (buffer_ref.second == VK_WHOLE_SIZE) {
       // Failed to upload buffer.
       return false;
@@ -830,8 +850,6 @@ bool VulkanCommandProcessor::IssueCopy() {
   // but I can't seem to find something similar.
   uint32_t dest_logical_width = copy_dest_pitch;
   uint32_t dest_logical_height = copy_dest_height;
-  uint32_t dest_block_width = xe::round_up(dest_logical_width, 32);
-  uint32_t dest_block_height = xe::round_up(dest_logical_height, 32);
 
   uint32_t window_offset = regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET].u32;
   int16_t window_offset_x = window_offset & 0x7FFF;
@@ -844,13 +862,14 @@ bool VulkanCommandProcessor::IssueCopy() {
     window_offset_y |= 0x8000;
   }
 
-  size_t read_size = GetTexelSize(copy_dest_format);
+  uint32_t dest_texel_size = uint32_t(GetTexelSize(copy_dest_format));
 
   // Adjust the copy base offset to point to the beginning of the texture, so
   // we don't run into hiccups down the road (e.g. resolving the last part going
   // backwards).
-  int32_t dest_offset = window_offset_y * copy_dest_pitch * int(read_size);
-  dest_offset += window_offset_x * 32 * int(read_size);
+  int32_t dest_offset =
+      window_offset_y * copy_dest_pitch * int(dest_texel_size);
+  dest_offset += window_offset_x * 32 * int(dest_texel_size);
   copy_dest_base += dest_offset;
 
   // HACK: vertices to use are always in vf0.
@@ -875,26 +894,24 @@ bool VulkanCommandProcessor::IssueCopy() {
   assert_true(fetch->size == 6);
   const uint8_t* vertex_addr = memory_->TranslatePhysical(fetch->address << 2);
   trace_writer_.WriteMemoryRead(fetch->address << 2, fetch->size * 4);
-  int32_t dest_min_x = int32_t((std::min(
-      std::min(
-          GpuSwap(xe::load<float>(vertex_addr + 0), Endian(fetch->endian)),
-          GpuSwap(xe::load<float>(vertex_addr + 8), Endian(fetch->endian))),
-      GpuSwap(xe::load<float>(vertex_addr + 16), Endian(fetch->endian)))));
-  int32_t dest_max_x = int32_t((std::max(
-      std::max(
-          GpuSwap(xe::load<float>(vertex_addr + 0), Endian(fetch->endian)),
-          GpuSwap(xe::load<float>(vertex_addr + 8), Endian(fetch->endian))),
-      GpuSwap(xe::load<float>(vertex_addr + 16), Endian(fetch->endian)))));
-  int32_t dest_min_y = int32_t((std::min(
-      std::min(
-          GpuSwap(xe::load<float>(vertex_addr + 4), Endian(fetch->endian)),
-          GpuSwap(xe::load<float>(vertex_addr + 12), Endian(fetch->endian))),
-      GpuSwap(xe::load<float>(vertex_addr + 20), Endian(fetch->endian)))));
-  int32_t dest_max_y = int32_t((std::max(
-      std::max(
-          GpuSwap(xe::load<float>(vertex_addr + 4), Endian(fetch->endian)),
-          GpuSwap(xe::load<float>(vertex_addr + 12), Endian(fetch->endian))),
-      GpuSwap(xe::load<float>(vertex_addr + 20), Endian(fetch->endian)))));
+
+  float dest_points[6];
+  for (int i = 0; i < 6; i++) {
+    dest_points[i] =
+        GpuSwap(xe::load<float>(vertex_addr + i * 4), Endian(fetch->endian)) +
+        0.5f;
+  }
+
+  // Note: The xenos only supports rectangle copies (luckily)
+  int32_t dest_min_x = int32_t(
+      (std::min(std::min(dest_points[0], dest_points[2]), dest_points[4])));
+  int32_t dest_max_x = int32_t(
+      (std::max(std::max(dest_points[0], dest_points[2]), dest_points[4])));
+
+  int32_t dest_min_y = int32_t(
+      (std::min(std::min(dest_points[1], dest_points[3]), dest_points[5])));
+  int32_t dest_max_y = int32_t(
+      (std::max(std::max(dest_points[1], dest_points[3]), dest_points[5])));
 
   uint32_t color_edram_base = 0;
   uint32_t depth_edram_base = 0;
@@ -920,55 +937,34 @@ bool VulkanCommandProcessor::IssueCopy() {
 
     depth_format =
         static_cast<DepthRenderTargetFormat>((depth_info >> 16) & 0x1);
-    if (!depth_clear_enabled) {
+    if (copy_src_select > 3) {
       copy_dest_format = TextureFormat::k_24_8;
     }
   }
 
+  Endian resolve_endian = Endian::k8in32;
+  if (copy_dest_endian <= Endian128::k16in32) {
+    resolve_endian = static_cast<Endian>(copy_dest_endian);
+  }
+
   // Demand a resolve texture from the texture cache.
-  TextureInfo tex_info = {};
-  tex_info.guest_address = copy_dest_base;
-  tex_info.width = dest_logical_width - 1;
-  tex_info.height = dest_logical_height - 1;
-  tex_info.dimension = gpu::Dimension::k2D;
-  tex_info.input_length = copy_dest_pitch * copy_dest_height * 4;
-  tex_info.format_info = FormatInfo::Get(uint32_t(copy_dest_format));
-  tex_info.size_2d.logical_width = dest_logical_width;
-  tex_info.size_2d.logical_height = dest_logical_height;
-  tex_info.size_2d.block_width = dest_block_width;
-  tex_info.size_2d.block_height = dest_block_height;
-  tex_info.size_2d.input_width = dest_block_width;
-  tex_info.size_2d.input_height = dest_block_height;
-  tex_info.size_2d.input_pitch = copy_dest_pitch * 4;
+  TextureInfo tex_info;
+  TextureInfo::PrepareResolve(copy_dest_base, copy_dest_format, resolve_endian,
+                              dest_logical_width, dest_logical_height,
+                              &tex_info);
+
   auto texture =
-      texture_cache_->DemandResolveTexture(tex_info, copy_dest_format, nullptr);
+      texture_cache_->DemandResolveTexture(tex_info, copy_dest_format);
   assert_not_null(texture);
   texture->in_flight_fence = current_batch_fence_;
 
   // For debugging purposes only (trace viewer)
   last_copy_base_ = texture->texture_info.guest_address;
 
-  if (!current_command_buffer_) {
-    command_buffer_pool_->BeginBatch();
-    current_command_buffer_ = command_buffer_pool_->AcquireEntry();
-    current_setup_buffer_ = command_buffer_pool_->AcquireEntry();
-    current_batch_fence_.reset(new ui::vulkan::Fence(*device_));
-
-    VkCommandBufferBeginInfo command_buffer_begin_info;
-    command_buffer_begin_info.sType =
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    command_buffer_begin_info.pNext = nullptr;
-    command_buffer_begin_info.flags =
-        VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    command_buffer_begin_info.pInheritanceInfo = nullptr;
-    auto status = vkBeginCommandBuffer(current_command_buffer_,
-                                       &command_buffer_begin_info);
-    CheckResult(status, "vkBeginCommandBuffer");
-
-    status =
-        vkBeginCommandBuffer(current_setup_buffer_, &command_buffer_begin_info);
-    CheckResult(status, "vkBeginCommandBuffer");
+  if (!frame_open_) {
+    BeginFrame();
   } else if (current_render_state_) {
+    // Copy commands cannot be issued within a render pass.
     render_cache_->EndRenderPass();
     current_render_state_ = nullptr;
   }
@@ -993,10 +989,32 @@ bool VulkanCommandProcessor::IssueCopy() {
             : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     texture->image_layout = VK_IMAGE_LAYOUT_GENERAL;
 
-    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &image_barrier);
   }
+
+  // Transition the image into a transfer destination layout, if needed.
+  // TODO: Util function for this
+  VkImageMemoryBarrier image_barrier;
+  image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  image_barrier.pNext = nullptr;
+  image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  image_barrier.srcAccessMask = 0;
+  image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  image_barrier.oldLayout = texture->image_layout;
+  image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  image_barrier.image = texture->image;
+  image_barrier.subresourceRange = {0, 0, 1, 0, 1};
+  image_barrier.subresourceRange.aspectMask =
+      copy_src_select <= 3
+          ? VK_IMAGE_ASPECT_COLOR_BIT
+          : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &image_barrier);
 
   VkOffset3D resolve_offset = {dest_min_x, dest_min_y, 0};
   VkExtent3D resolve_extent = {uint32_t(dest_max_x - dest_min_x),
@@ -1029,6 +1047,15 @@ bool VulkanCommandProcessor::IssueCopy() {
       assert_always();
       break;
   }
+
+  // And pull it back from a transfer destination.
+  image_barrier.srcAccessMask = image_barrier.dstAccessMask;
+  image_barrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+  std::swap(image_barrier.newLayout, image_barrier.oldLayout);
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &image_barrier);
 
   // Perform any requested clears.
   uint32_t copy_depth_clear = regs[XE_GPU_REG_RB_DEPTH_CLEAR].u32;

@@ -53,6 +53,9 @@ class VulkanSwapChain {
   // torn down and recreated with the new surface properties (size/etc).
   bool Reinitialize();
 
+  // Waits on and signals a semaphore in this operation.
+  void WaitAndSignalSemaphore(VkSemaphore sem);
+
   // Begins the swap operation, preparing state for rendering.
   bool Begin();
   // Ends the swap operation, finalizing rendering and presenting the results.
@@ -61,6 +64,7 @@ class VulkanSwapChain {
  private:
   struct Buffer {
     VkImage image = nullptr;
+    VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageView image_view = nullptr;
     VkFramebuffer framebuffer = nullptr;
   };
@@ -79,6 +83,7 @@ class VulkanSwapChain {
   uint32_t surface_height_ = 0;
   VkFormat surface_format_ = VK_FORMAT_UNDEFINED;
   VkCommandPool cmd_pool_ = nullptr;
+  VkCommandBuffer cmd_buffer_ = nullptr;
   VkCommandBuffer copy_cmd_buffer_ = nullptr;
   VkCommandBuffer render_cmd_buffer_ = nullptr;
   VkRenderPass render_pass_ = nullptr;
@@ -86,6 +91,7 @@ class VulkanSwapChain {
   VkSemaphore image_usage_semaphore_ = nullptr;
   uint32_t current_buffer_index_ = 0;
   std::vector<Buffer> buffers_;
+  std::vector<VkSemaphore> wait_and_signal_semaphores_;
 };
 
 }  // namespace vulkan

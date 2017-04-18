@@ -49,7 +49,8 @@ class BaseFencedPool {
   void Scavenge() {
     while (pending_batch_list_head_) {
       auto batch = pending_batch_list_head_;
-      if (vkGetFenceStatus(device_, *batch->fence) == VK_SUCCESS) {
+      assert_not_null(batch->fence);
+      if (vkGetFenceStatus(device_, batch->fence) == VK_SUCCESS) {
         // Batch has completed. Reclaim.
         pending_batch_list_head_ = batch->next;
         if (batch == pending_batch_list_tail_) {
@@ -71,8 +72,10 @@ class BaseFencedPool {
 
   // Begins a new batch.
   // All entries acquired within this batch will be marked as in-use until
-  // the fence specified in EndBatch is signalled.
-  void BeginBatch() {
+  // the fence returned is signalled.
+  // Pass in a fence to use an external fence. This assumes the fence has been
+  // reset.
+  VkFence BeginBatch(VkFence fence = nullptr) {
     assert_null(open_batch_);
     Batch* batch = nullptr;
     if (free_batch_list_head_) {
@@ -80,15 +83,56 @@ class BaseFencedPool {
       batch = free_batch_list_head_;
       free_batch_list_head_ = batch->next;
       batch->next = nullptr;
+
+      if (batch->flags & kBatchOwnsFence && !fence) {
+        // Reset owned fence.
+        vkResetFences(device_, 1, &batch->fence);
+      } else if ((batch->flags & kBatchOwnsFence) && fence) {
+        // Transfer owned -> external
+        vkDestroyFence(device_, batch->fence, nullptr);
+        batch->fence = fence;
+      } else if (!(batch->flags & kBatchOwnsFence) && !fence) {
+        // external -> owned
+        VkFenceCreateInfo info;
+        info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        info.pNext = nullptr;
+        info.flags = 0;
+        VkResult res = vkCreateFence(device_, &info, nullptr, &batch->fence);
+        if (res != VK_SUCCESS) {
+          assert_always();
+        }
+
+        batch->flags |= kBatchOwnsFence;
+      } else {
+        // external -> external
+        batch->fence = fence;
+      }
     } else {
       // Allocate new batch.
       batch = new Batch();
       batch->next = nullptr;
+      batch->flags = 0;
+
+      if (!fence) {
+        VkFenceCreateInfo info;
+        info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        info.pNext = nullptr;
+        info.flags = 0;
+        VkResult res = vkCreateFence(device_, &info, nullptr, &batch->fence);
+        if (res != VK_SUCCESS) {
+          assert_always();
+        }
+
+        batch->flags |= kBatchOwnsFence;
+      } else {
+        batch->fence = fence;
+      }
     }
     batch->entry_list_head = nullptr;
     batch->entry_list_tail = nullptr;
-    batch->fence = nullptr;
     open_batch_ = batch;
+
+    return batch->fence;
   }
 
   // Cancels an open batch, and releases all entries acquired within.
@@ -109,33 +153,8 @@ class BaseFencedPool {
     batch->entry_list_tail = nullptr;
   }
 
-  // Attempts to acquire an entry from the pool in the current batch.
-  // If none are available a new one will be allocated.
-  HANDLE AcquireEntry() {
-    Entry* entry = nullptr;
-    if (free_entry_list_head_) {
-      // Slice off an entry from the free list.
-      entry = free_entry_list_head_;
-      free_entry_list_head_ = entry->next;
-    } else {
-      // No entry available; allocate new.
-      entry = new Entry();
-      entry->handle = static_cast<T*>(this)->AllocateEntry();
-    }
-    entry->next = nullptr;
-    if (!open_batch_->entry_list_head) {
-      open_batch_->entry_list_head = entry;
-    }
-    if (open_batch_->entry_list_tail) {
-      open_batch_->entry_list_tail->next = entry;
-    }
-    open_batch_->entry_list_tail = entry;
-    return entry->handle;
-  }
-
-  // Ends the current batch using the given fence to indicate when the batch
-  // has completed execution on the GPU.
-  void EndBatch(std::shared_ptr<Fence> fence) {
+  // Ends the current batch.
+  void EndBatch() {
     assert_not_null(open_batch_);
 
     // Close and see if we have anything.
@@ -147,9 +166,6 @@ class BaseFencedPool {
       free_batch_list_head_ = batch;
       return;
     }
-
-    // Track the fence.
-    batch->fence = fence;
 
     // Append to the end of the batch list.
     batch->next = nullptr;
@@ -165,9 +181,52 @@ class BaseFencedPool {
   }
 
  protected:
-  void PushEntry(HANDLE handle) {
+  // Attempts to acquire an entry from the pool in the current batch.
+  // If none are available a new one will be allocated.
+  HANDLE AcquireEntry(void* data) {
+    Entry* entry = nullptr;
+    if (free_entry_list_head_) {
+      // Slice off an entry from the free list.
+      Entry* prev = nullptr;
+      Entry* cur = free_entry_list_head_;
+      while (cur != nullptr) {
+        if (cur->data == data) {
+          if (prev) {
+            prev->next = cur->next;
+          } else {
+            free_entry_list_head_ = cur->next;
+          }
+
+          entry = cur;
+          break;
+        }
+
+        prev = cur;
+        cur = cur->next;
+      }
+    }
+
+    if (!entry) {
+      // No entry available; allocate new.
+      entry = new Entry();
+      entry->data = data;
+      entry->handle = static_cast<T*>(this)->AllocateEntry(data);
+    }
+    entry->next = nullptr;
+    if (!open_batch_->entry_list_head) {
+      open_batch_->entry_list_head = entry;
+    }
+    if (open_batch_->entry_list_tail) {
+      open_batch_->entry_list_tail->next = entry;
+    }
+    open_batch_->entry_list_tail = entry;
+    return entry->handle;
+  }
+
+  void PushEntry(HANDLE handle, void* data) {
     auto entry = new Entry();
     entry->next = free_entry_list_head_;
+    entry->data = data;
     entry->handle = handle;
     free_entry_list_head_ = entry;
   }
@@ -177,6 +236,11 @@ class BaseFencedPool {
     while (free_batch_list_head_) {
       auto batch = free_batch_list_head_;
       free_batch_list_head_ = batch->next;
+
+      if (batch->flags & kBatchOwnsFence) {
+        vkDestroyFence(device_, batch->fence, nullptr);
+        batch->fence = nullptr;
+      }
       delete batch;
     }
     while (free_entry_list_head_) {
@@ -192,14 +256,18 @@ class BaseFencedPool {
  private:
   struct Entry {
     Entry* next;
+    void* data;
     HANDLE handle;
   };
   struct Batch {
     Batch* next;
     Entry* entry_list_head;
     Entry* entry_list_tail;
-    std::shared_ptr<Fence> fence;
+    uint32_t flags;
+    VkFence fence;
   };
+
+  static const uint32_t kBatchOwnsFence = 1;
 
   Batch* free_batch_list_head_ = nullptr;
   Entry* free_entry_list_head_ = nullptr;
@@ -211,17 +279,44 @@ class BaseFencedPool {
 class CommandBufferPool
     : public BaseFencedPool<CommandBufferPool, VkCommandBuffer> {
  public:
+  typedef BaseFencedPool<CommandBufferPool, VkCommandBuffer> Base;
+
   CommandBufferPool(VkDevice device, uint32_t queue_family_index,
                     VkCommandBufferLevel level);
   ~CommandBufferPool() override;
 
+  VkCommandBuffer AcquireEntry() { return Base::AcquireEntry(nullptr); }
+
  protected:
   friend class BaseFencedPool<CommandBufferPool, VkCommandBuffer>;
-  VkCommandBuffer AllocateEntry();
+  VkCommandBuffer AllocateEntry(void* data);
   void FreeEntry(VkCommandBuffer handle);
 
   VkCommandPool command_pool_ = nullptr;
   VkCommandBufferLevel level_ = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+};
+
+class DescriptorPool : public BaseFencedPool<DescriptorPool, VkDescriptorSet> {
+ public:
+  typedef BaseFencedPool<DescriptorPool, VkDescriptorSet> Base;
+
+  DescriptorPool(VkDevice device, uint32_t max_count,
+                 std::vector<VkDescriptorPoolSize> pool_sizes);
+  ~DescriptorPool() override;
+
+  VkDescriptorSet AcquireEntry(VkDescriptorSetLayout layout) {
+    return Base::AcquireEntry(layout);
+  }
+
+  // WARNING: Allocating sets from the vulkan pool will not be tracked!
+  VkDescriptorPool descriptor_pool() { return descriptor_pool_; }
+
+ protected:
+  friend class BaseFencedPool<DescriptorPool, VkDescriptorSet>;
+  VkDescriptorSet AllocateEntry(void* data);
+  void FreeEntry(VkDescriptorSet handle);
+
+  VkDescriptorPool descriptor_pool_ = nullptr;
 };
 
 }  // namespace vulkan

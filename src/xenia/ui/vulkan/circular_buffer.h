@@ -40,7 +40,7 @@ class CircularBuffer {
 
     // Allocation usage fence. This allocation will be deleted when the fence
     // becomes signaled.
-    std::shared_ptr<Fence> fence;
+    VkFence fence;
   };
 
   bool Initialize(VkDeviceMemory memory, VkDeviceSize offset);
@@ -59,8 +59,9 @@ class CircularBuffer {
 
   // Acquires space to hold memory. This allocation is only freed when the fence
   // reaches the signaled state.
-  Allocation* Acquire(VkDeviceSize length, std::shared_ptr<Fence> fence);
+  Allocation* Acquire(VkDeviceSize length, VkFence fence);
   void Flush(Allocation* allocation);
+  void Flush(VkDeviceSize offset, VkDeviceSize length);
 
   // Clears all allocations, regardless of whether they've been consumed or not.
   void Clear();
